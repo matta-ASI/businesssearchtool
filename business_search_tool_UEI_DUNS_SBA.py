@@ -1,0 +1,674 @@
+import pandas as pd
+import requests
+import time
+import json
+import csv
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+import logging
+from urllib.parse import quote, urlencode
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class BusinessDatasetSearcher:
+    """
+    A comprehensive tool to search for businesses across multiple public datasets
+    """
+    
+    def __init__(self):
+        self.results = []
+        self.api_delays = {
+            'sam': 1,  # 1 second delay for SAM.gov
+            'usaspending': 0.5,
+            'census': 0.5,
+            'edgar': 1,
+            'sba': 0.5
+        }
+        
+    def read_business_csv(self, filepath: str) -> List[Dict]:
+        """
+        Read CSV file containing business names and identifiers
+        Expected columns: 'business_name', optionally 'city', 'state', 'zip', 'uei', 'duns'
+        """
+        try:
+            df = pd.read_csv(filepath)
+            logger.info(f"Loaded {len(df)} businesses from {filepath}")
+            
+            # Ensure business_name column exists (or UEI/DUNS for direct lookup)
+            if 'business_name' not in df.columns and 'uei' not in df.columns and 'duns' not in df.columns:
+                raise ValueError("CSV must contain at least one of: 'business_name', 'uei', or 'duns' columns")
+            
+            # Clean and standardize columns
+            if 'uei' in df.columns:
+                df['uei'] = df['uei'].astype(str).str.strip().str.upper()
+                df['uei'] = df['uei'].replace('NAN', None)
+            
+            if 'duns' in df.columns:
+                df['duns'] = df['duns'].astype(str).str.strip()
+                df['duns'] = df['duns'].replace('NAN', None)
+                # Remove any dashes or spaces from DUNS numbers
+                df['duns'] = df['duns'].str.replace(r'[-\s]', '', regex=True)
+            
+            # Convert to list of dictionaries
+            businesses = df.to_dict('records')
+            return businesses
+        except Exception as e:
+            logger.error(f"Error reading CSV: {e}")
+            return []
+    
+    def search_sam_gov(self, business_name: str, location_info: Dict = None, uei: str = None, duns: str = None) -> Dict:
+        """
+        Search SAM.gov for business registration information
+        Supports search by business name, UEI, or DUNS number
+        """
+        try:
+            # SAM.gov API endpoint (public data)
+            base_url = "https://api.sam.gov/entity-information/v3/entities"
+            
+            params = {
+                'api_key': os.getenv('SAM_API_KEY', ''),  # Requires API key
+                'includeSections': 'entityRegistration,coreData,exclusions,registrationDates'
+            }
+            
+            # Search by UEI if provided
+            if uei:
+                params['ueiSAM'] = uei
+                logger.info(f"Searching SAM.gov by UEI: {uei}")
+            # Search by DUNS if provided (legacy)
+            elif duns:
+                params['ueiDUNS'] = duns  # DUNS converted to UEI format
+                logger.info(f"Searching SAM.gov by DUNS: {duns}")
+            # Search by business name
+            else:
+                params['legalBusinessName'] = business_name
+                logger.info(f"Searching SAM.gov by business name: {business_name}")
+            
+            if location_info and location_info.get('state'):
+                params['stateOrProvinceCode'] = location_info['state']
+            
+            # Note: SAM.gov requires API key for most searches
+            if not params['api_key']:
+                logger.warning("SAM.gov API key not found in environment variables")
+                return {'source': 'SAM.gov', 'status': 'API key required', 'data': None}
+            
+            response = requests.get(base_url, params=params, timeout=30)
+            time.sleep(self.api_delays['sam'])
+            
+            if response.status_code == 200:
+                data = response.json()
+                entities = data.get('entityData', [])
+                if entities:
+                    entity = entities[0]
+                    entity_reg = entity.get('entityRegistration', {})
+                    core_data = entity.get('coreData', {})
+                    exclusions = entity.get('exclusions', {})
+                    
+                    return {
+                        'source': 'SAM.gov',
+                        'status': 'found',
+                        'data': {
+                            'uei_sam': entity_reg.get('ueiSAM'),
+                            'uei_duns': entity_reg.get('ueiDUNS'),  # Legacy DUNS in UEI format
+                            'duns_number': entity_reg.get('duns'),  # Original DUNS if available
+                            'cage_code': entity_reg.get('cageCode'),
+                            'legal_name': core_data.get('legalBusinessName'),
+                            'dba_name': core_data.get('dbaName'),
+                            'registration_status': entity_reg.get('registrationStatus'),
+                            'registration_date': entity_reg.get('registrationDate'),
+                            'expiration_date': entity_reg.get('expirationDate'),
+                            'last_update_date': entity_reg.get('lastUpdateDate'),
+                            'naics_codes': [naics.get('naicsCode') for naics in entity.get('naicsInformation', {}).get('primaryNaics', [])],
+                            'exclusion_status': exclusions.get('excludedInd', False),
+                            'address': {
+                                'street': core_data.get('physicalAddress', {}).get('addressLine1'),
+                                'city': core_data.get('physicalAddress', {}).get('city'),
+                                'state': core_data.get('physicalAddress', {}).get('stateOrProvinceCode'),
+                                'zip': core_data.get('physicalAddress', {}).get('zipCode'),
+                                'country': core_data.get('physicalAddress', {}).get('countryCode')
+                            }
+                        }
+                    }
+            
+            return {'source': 'SAM.gov', 'status': 'not_found', 'data': None}
+            
+        except Exception as e:
+            logger.error(f"Error searching SAM.gov: {e}")
+            return {'source': 'SAM.gov', 'status': 'error', 'data': str(e)}
+    
+    def search_usaspending(self, business_name: str) -> Dict:
+        """
+        Search USAspending.gov for federal awards
+        """
+        try:
+            base_url = "https://api.usaspending.gov/api/v2/search/spending_by_award/"
+            
+            payload = {
+                "filters": {
+                    "recipient_search_text": [business_name],
+                    "award_type_codes": ["A", "B", "C", "D"]  # Contracts and grants
+                },
+                "fields": ["Award ID", "Recipient Name", "Award Amount", "Award Type", "Period of Performance Start Date"],
+                "sort": "Award Amount",
+                "order": "desc",
+                "limit": 10
+            }
+            
+            response = requests.post(base_url, json=payload, timeout=30)
+            time.sleep(self.api_delays['usaspending'])
+            
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get('results', [])
+                if results:
+                    awards = []
+                    total_amount = 0
+                    for award in results:
+                        award_amount = award.get('Award Amount', 0)
+                        total_amount += award_amount
+                        awards.append({
+                            'award_id': award.get('Award ID'),
+                            'recipient_name': award.get('Recipient Name'),
+                            'amount': award_amount,
+                            'type': award.get('Award Type'),
+                            'start_date': award.get('Period of Performance Start Date')
+                        })
+                    
+                    return {
+                        'source': 'USAspending.gov',
+                        'status': 'found',
+                        'data': {
+                            'total_awards': len(awards),
+                            'total_amount': total_amount,
+                            'awards': awards[:5]  # Top 5 awards
+                        }
+                    }
+            
+            return {'source': 'USAspending.gov', 'status': 'not_found', 'data': None}
+            
+        except Exception as e:
+            logger.error(f"Error searching USAspending.gov for {business_name}: {e}")
+            return {'source': 'USAspending.gov', 'status': 'error', 'data': str(e)}
+    
+    def search_edgar_sec(self, business_name: str) -> Dict:
+        """
+        Search SEC EDGAR database for public company filings
+        """
+        try:
+            # SEC Company Search API
+            base_url = "https://www.sec.gov/files/company_tickers.json"
+            
+            headers = {
+                'User-Agent': 'Business Search Tool contact@yourcompany.com'
+            }
+            
+            response = requests.get(base_url, headers=headers, timeout=30)
+            time.sleep(self.api_delays['edgar'])
+            
+            if response.status_code == 200:
+                companies = response.json()
+                
+                # Search for business name in company data
+                matches = []
+                search_name = business_name.lower()
+                
+                for cik, company_data in companies.items():
+                    if isinstance(company_data, dict):
+                        company_name = company_data.get('title', '').lower()
+                        ticker = company_data.get('ticker', '')
+                        
+                        if search_name in company_name or company_name in search_name:
+                            matches.append({
+                                'cik': company_data.get('cik_str'),
+                                'ticker': ticker,
+                                'company_name': company_data.get('title'),
+                                'match_score': len(set(search_name.split()) & set(company_name.split()))
+                            })
+                
+                if matches:
+                    # Sort by match score
+                    matches.sort(key=lambda x: x['match_score'], reverse=True)
+                    return {
+                        'source': 'SEC EDGAR',
+                        'status': 'found',
+                        'data': {
+                            'matches_found': len(matches),
+                            'best_match': matches[0],
+                            'all_matches': matches[:3]  # Top 3 matches
+                        }
+                    }
+            
+            return {'source': 'SEC EDGAR', 'status': 'not_found', 'data': None}
+            
+        except Exception as e:
+            logger.error(f"Error searching SEC EDGAR for {business_name}: {e}")
+            return {'source': 'SEC EDGAR', 'status': 'error', 'data': str(e)}
+    
+    def search_sba_certifications(self, business_name: str, uei: str = None, duns: str = None, location_info: Dict = None) -> Dict:
+        """
+        Search SBA Certifications database (search.certifications.sba.gov)
+        This searches the official SBA certification portal for various small business programs
+        """
+        try:
+            # SBA Certifications search endpoint
+            base_url = "https://search.certifications.sba.gov/api/search"
+            
+            # Prepare search parameters
+            search_params = {
+                'pageSize': 50,  # Get up to 50 results
+                'sortBy': 'companyName',
+                'sortOrder': 'asc'
+            }
+            
+            # Search by UEI if available (most accurate)
+            if uei:
+                search_params['uei'] = uei.strip()
+                logger.info(f"Searching SBA Certifications by UEI: {uei}")
+            elif duns:
+                search_params['duns'] = duns.strip()
+                logger.info(f"Searching SBA Certifications by DUNS: {duns}")
+            else:
+                search_params['companyName'] = business_name
+                logger.info(f"Searching SBA Certifications by name: {business_name}")
+            
+            # Add location filters if available
+            if location_info:
+                if location_info.get('state'):
+                    search_params['state'] = location_info['state']
+                if location_info.get('city'):
+                    search_params['city'] = location_info['city']
+            
+            headers = {
+                'User-Agent': 'Business Search Tool - SBA Certification Lookup',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }
+            
+            response = requests.get(base_url, params=search_params, headers=headers, timeout=30)
+            time.sleep(self.api_delays['sba'])
+            
+            if response.status_code == 200:
+                data = response.json()
+                companies = data.get('data', {}).get('companies', [])
+                
+                if companies:
+                    # Process the certification results
+                    certification_results = []
+                    
+                    for company in companies[:10]:  # Limit to top 10 results
+                        # Extract certification information
+                        certifications = []
+                        cert_details = company.get('certifications', [])
+                        
+                        for cert in cert_details:
+                            cert_info = {
+                                'program': cert.get('program'),
+                                'status': cert.get('status'),
+                                'certification_date': cert.get('certificationDate'),
+                                'expiration_date': cert.get('expirationDate'),
+                                'certifying_office': cert.get('certifyingOffice')
+                            }
+                            certifications.append(cert_info)
+                        
+                        company_result = {
+                            'company_name': company.get('companyName'),
+                            'uei': company.get('uei'),
+                            'duns': company.get('duns'),
+                            'address': {
+                                'street': company.get('address'),
+                                'city': company.get('city'),
+                                'state': company.get('state'),
+                                'zip': company.get('zipCode')
+                            },
+                            'phone': company.get('phoneNumber'),
+                            'website': company.get('website'),
+                            'business_type': company.get('businessType'),
+                            'naics_codes': company.get('naicsCodes', []),
+                            'certifications': certifications,
+                            'total_certifications': len(certifications),
+                            'active_certifications': len([c for c in certifications if c.get('status', '').lower() == 'active'])
+                        }
+                        certification_results.append(company_result)
+                    
+                    # Find best match if searching by name
+                    best_match = certification_results[0]
+                    if not uei and not duns and business_name:
+                        # Score matches based on name similarity
+                        search_name_lower = business_name.lower()
+                        for company in certification_results:
+                            company_name_lower = company.get('company_name', '').lower()
+                            if search_name_lower in company_name_lower or company_name_lower in search_name_lower:
+                                best_match = company
+                                break
+                    
+                    return {
+                        'source': 'SBA Certifications',
+                        'status': 'found',
+                        'data': {
+                            'total_matches': len(certification_results),
+                            'best_match': best_match,
+                            'all_matches': certification_results,
+                            'search_parameters': search_params,
+                            'certification_programs_found': list(set([
+                                cert['program'] 
+                                for company in certification_results 
+                                for cert in company.get('certifications', [])
+                                if cert.get('program')
+                            ]))
+                        }
+                    }
+                else:
+                    return {'source': 'SBA Certifications', 'status': 'not_found', 'data': None}
+            
+            elif response.status_code == 404:
+                return {'source': 'SBA Certifications', 'status': 'not_found', 'data': None}
+            else:
+                return {
+                    'source': 'SBA Certifications', 
+                    'status': 'error', 
+                    'data': f'HTTP {response.status_code}: {response.text[:200]}'
+                }
+            
+        except Exception as e:
+            logger.error(f"Error searching SBA Certifications: {e}")
+            return {'source': 'SBA Certifications', 'status': 'error', 'data': str(e)}
+
+    def search_sba_data(self, business_name: str, location_info: Dict = None) -> Dict:
+        """
+        Search additional SBA datasets for loan data and other programs
+        Note: This searches downloadable CSV datasets that require local processing
+        """
+        try:
+            # This is a placeholder for additional SBA data sources that require CSV processing
+            return {
+                'source': 'SBA Additional Data',
+                'status': 'requires_csv_processing',
+                'data': {
+                    'note': 'Additional SBA data requires downloading CSV files and local processing',
+                    'datasets_to_check': [
+                        'PPP Loan Data',
+                        'EIDL Loan Data', 
+                        'SBA Loan Guarantees (7(a) and 504)',
+                        'SBIR/STTR Awards',
+                        'Mentor-Protégé Program'
+                    ],
+                    'recommendation': 'Use SBA Certifications search for live certification data'
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing additional SBA data for {business_name}: {e}")
+            return {'source': 'SBA Additional Data', 'status': 'error', 'data': str(e)}
+    
+    def search_business_across_datasets(self, business_info: Dict) -> Dict:
+        """
+        Search a single business across all available datasets
+        Supports search by business name, UEI, or DUNS number
+        """
+        business_name = business_info.get('business_name', '')
+        uei = business_info.get('uei')
+        duns = business_info.get('duns')
+        
+        # Use UEI or DUNS as primary identifier if available
+        primary_identifier = uei or duns or business_name
+        
+        location_info = {
+            'city': business_info.get('city'),
+            'state': business_info.get('state'),
+            'zip': business_info.get('zip')
+        }
+        
+        logger.info(f"Searching for: {primary_identifier}")
+        if uei:
+            logger.info(f"  Using UEI: {uei}")
+        elif duns:
+            logger.info(f"  Using DUNS: {duns}")
+        
+        # Initialize results for this business
+        business_results = {
+            'business_name': business_name,
+            'uei': uei,
+            'duns': duns,
+            'location': location_info,
+            'search_timestamp': datetime.now().isoformat(),
+            'datasets_searched': []
+        }
+        
+        # Search each dataset
+        datasets_to_search = [
+            ('sam_gov', lambda: self.search_sam_gov(business_name, location_info, uei, duns)),
+            ('sba_certifications', lambda: self.search_sba_certifications(business_name, uei, duns, location_info)),
+            ('usaspending', lambda: self.search_usaspending(business_name or primary_identifier)),
+            ('edgar_sec', lambda: self.search_edgar_sec(business_name or primary_identifier)),
+            ('sba_additional', lambda: self.search_sba_data(business_name or primary_identifier, location_info))
+        ]
+        
+        for dataset_name, search_func in datasets_to_search:
+            try:
+                result = search_func()
+                business_results['datasets_searched'].append(result)
+                logger.info(f"Completed search in {result['source']}: {result['status']}")
+            except Exception as e:
+                logger.error(f"Failed to search {dataset_name}: {e}")
+                business_results['datasets_searched'].append({
+                    'source': dataset_name,
+                    'status': 'error',
+                    'data': str(e)
+                })
+        
+        return business_results
+    
+    def process_businesses(self, businesses: List[Dict]) -> List[Dict]:
+        """
+        Process all businesses and return comprehensive results
+        """
+        all_results = []
+        total_businesses = len(businesses)
+        
+        for idx, business in enumerate(businesses, 1):
+            logger.info(f"Processing business {idx}/{total_businesses}: {business.get('business_name', 'Unknown')}")
+            
+            try:
+                result = self.search_business_across_datasets(business)
+                all_results.append(result)
+                
+                # Small delay between businesses to be respectful to APIs
+                time.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Error processing business {business.get('business_name')}: {e}")
+                all_results.append({
+                    'business_name': business.get('business_name'),
+                    'error': str(e),
+                    'search_timestamp': datetime.now().isoformat()
+                })
+        
+        return all_results
+    
+    def generate_report(self, results: List[Dict], output_file: str = None) -> str:
+        """
+        Generate a comprehensive report from search results
+        """
+        if not output_file:
+            output_file = f"business_search_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        
+        # Generate HTML report
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Business Dataset Search Report</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .business { border: 1px solid #ddd; margin: 20px 0; padding: 15px; }
+                .found { background-color: #e8f5e8; }
+                .not-found { background-color: #fff3cd; }
+                .error { background-color: #f8d7da; }
+                .dataset-result { margin: 10px 0; padding: 10px; border-left: 3px solid #007bff; }
+                .summary { background-color: #f8f9fa; padding: 15px; margin: 20px 0; }
+                table { border-collapse: collapse; width: 100%; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; }
+            </style>
+        </head>
+        <body>
+            <h1>Business Dataset Search Report</h1>
+            <p>Generated on: """ + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + """</p>
+        """
+        
+        # Summary statistics
+        total_businesses = len(results)
+        businesses_with_findings = 0
+        dataset_stats = {}
+        
+        for result in results:
+            has_findings = False
+            for dataset_result in result.get('datasets_searched', []):
+                dataset_name = dataset_result.get('source', 'Unknown')
+                if dataset_name not in dataset_stats:
+                    dataset_stats[dataset_name] = {'found': 0, 'not_found': 0, 'error': 0}
+                
+                status = dataset_result.get('status', 'error')
+                if status == 'found':
+                    dataset_stats[dataset_name]['found'] += 1
+                    has_findings = True
+                elif status == 'not_found':
+                    dataset_stats[dataset_name]['not_found'] += 1
+                else:
+                    dataset_stats[dataset_name]['error'] += 1
+            
+            if has_findings:
+                businesses_with_findings += 1
+        
+        # Add summary section
+        html_content += f"""
+        <div class="summary">
+            <h2>Summary</h2>
+            <p><strong>Total Businesses Searched:</strong> {total_businesses}</p>
+            <p><strong>Businesses with Findings:</strong> {businesses_with_findings}</p>
+            
+            <h3>Dataset Search Statistics</h3>
+            <table>
+                <tr><th>Dataset</th><th>Found</th><th>Not Found</th><th>Errors</th></tr>
+        """
+        
+        for dataset, stats in dataset_stats.items():
+            html_content += f"""
+                <tr>
+                    <td>{dataset}</td>
+                    <td>{stats['found']}</td>
+                    <td>{stats['not_found']}</td>
+                    <td>{stats['error']}</td>
+                </tr>
+            """
+        
+        html_content += """
+            </table>
+        </div>
+        
+        <h2>Detailed Results</h2>
+        """
+        
+        # Add detailed results for each business
+        for result in results:
+            business_name = result.get('business_name', 'Unknown Business')
+            has_findings = any(ds.get('status') == 'found' for ds in result.get('datasets_searched', []))
+            
+            css_class = 'found' if has_findings else 'not-found'
+            
+            html_content += f"""
+            <div class="business {css_class}">
+                <h3>{business_name}</h3>
+                <p><strong>Search Date:</strong> {result.get('search_timestamp', 'Unknown')}</p>
+            """
+            
+            # Add location info if available
+            location = result.get('location', {})
+            if any(location.values()):
+                location_str = ', '.join(filter(None, [location.get('city'), location.get('state'), location.get('zip')]))
+                if location_str:
+                    html_content += f"<p><strong>Location:</strong> {location_str}</p>"
+            
+            # Add dataset results
+            for dataset_result in result.get('datasets_searched', []):
+                source = dataset_result.get('source', 'Unknown')
+                status = dataset_result.get('status', 'unknown')
+                data = dataset_result.get('data')
+                
+                html_content += f"""
+                <div class="dataset-result">
+                    <h4>{source} - Status: {status.upper()}</h4>
+                """
+                
+                if data and status == 'found':
+                    html_content += f"<pre>{json.dumps(data, indent=2, default=str)}</pre>"
+                elif status == 'error':
+                    html_content += f"<p><em>Error: {data}</em></p>"
+                elif status == 'not_found':
+                    html_content += "<p><em>No records found</em></p>"
+                
+                html_content += "</div>"
+            
+            html_content += "</div>"
+        
+        html_content += """
+        </body>
+        </html>
+        """
+        
+        # Write report to file
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        logger.info(f"Report generated: {output_file}")
+        return output_file
+
+def main():
+    """
+    Main function to demonstrate usage
+    """
+    # Initialize the searcher
+    searcher = BusinessDatasetSearcher()
+    
+    # Example usage
+    csv_file = "business_list.csv"  # Replace with your CSV file path
+    
+    # Check if CSV file exists
+    if not os.path.exists(csv_file):
+        # Create a sample CSV for demonstration
+        sample_data = [
+            {"business_name": "Microsoft Corporation", "city": "Redmond", "state": "WA"},
+            {"business_name": "Apple Inc", "city": "Cupertino", "state": "CA"},
+            {"business_name": "Small Business Example LLC", "city": "Chicago", "state": "IL"}
+        ]
+        
+        df = pd.DataFrame(sample_data)
+        df.to_csv(csv_file, index=False)
+        logger.info(f"Created sample CSV file: {csv_file}")
+    
+    # Read businesses from CSV
+    businesses = searcher.read_business_csv(csv_file)
+    
+    if businesses:
+        # Process all businesses
+        logger.info(f"Starting search for {len(businesses)} businesses...")
+        results = searcher.process_businesses(businesses)
+        
+        # Generate report
+        report_file = searcher.generate_report(results)
+        
+        # Also save results as JSON
+        json_file = f"business_search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(json_file, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        
+        logger.info(f"Search complete! Results saved to:")
+        logger.info(f"  HTML Report: {report_file}")
+        logger.info(f"  JSON Data: {json_file}")
+    else:
+        logger.error("No businesses found in CSV file")
+
+if __name__ == "__main__":
+    main()
