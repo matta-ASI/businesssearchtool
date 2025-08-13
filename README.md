@@ -103,3 +103,79 @@ DUNS still works but may be phased out eventually
 Cross-dataset linking: UEI/DUNS from SAM.gov can help identify the same entity in other datasets
 
 This makes the tool much more powerful for government contracting research, compliance checking, and business verification using the official federal identifiers!
+
+
+Yes, absolutely! The SBA Certifications database is a great addition. Let me add a dedicated search function for it:Perfect! I've added comprehensive support for the **SBA Certifications database** (search.certifications.sba.gov). Here's what the new functionality provides:
+
+## SBA Certifications Search Features:
+
+### 1. **Multiple Search Methods**
+- **UEI search** (most accurate)
+- **DUNS search** (legacy support) 
+- **Business name search** (with location filters)
+
+### 2. **Complete Certification Data**
+The search retrieves:
+- **Company Details**: Name, UEI, DUNS, address, phone, website
+- **Business Information**: Business type, NAICS codes
+- **All Certifications**: Including:
+  - 8(a) Business Development
+  - HUBZone Certified
+  - Women-Owned Small Business (WOSB)
+  - Service-Disabled Veteran-Owned (SDVOSB)
+  - Disadvantaged Business Enterprise (DBE)
+  - And other SBA certification programs
+
+### 3. **Certification Details**
+For each certification:
+- Program name
+- Status (Active/Inactive/Pending)
+- Certification date
+- Expiration date
+- Certifying office
+
+### 4. **Smart Matching**
+- Returns multiple matches with similarity scoring
+- Best match identification for name searches
+- Complete match details for verification
+
+## Key Benefits:
+
+✅ **Live Data**: Real-time certification status (not outdated CSV files)  
+✅ **Official Source**: Direct from SBA's certification portal  
+✅ **Comprehensive**: All major SBA certification programs in one search  
+✅ **UEI/DUNS Compatible**: Works with modern and legacy identifiers  
+✅ **Location Filtering**: Can narrow search by state/city  
+
+## Sample Output:
+```json
+{
+  "source": "SBA Certifications",
+  "status": "found",
+  "data": {
+    "best_match": {
+      "company_name": "ABC Small Business LLC",
+      "uei": "ABC123UEI456",
+      "certifications": [
+        {
+          "program": "8(a) Business Development",
+          "status": "Active",
+          "certification_date": "2023-01-15",
+          "expiration_date": "2032-01-15"
+        }
+      ],
+      "active_certifications": 1
+    },
+    "certification_programs_found": ["8(a)", "HUBZone", "WOSB"]
+  }
+}
+```
+
+This addition makes your tool much more powerful for:
+- **Government contracting research**
+- **Small business verification**
+- **Certification status checking**
+- **Compliance verification**
+- **Market research on certified small businesses**
+
+The SBA Certifications search is now integrated into the main search flow, so it will automatically run for each business in your CSV file alongside the other datasets!
